@@ -1,14 +1,18 @@
-from pyspark import pipelines as dp
-from pyspark.sql.functions import *
-
-catalog = 'dbx_hck_glbl_mart'
-read_schema = 'bronze'
-write_schema = 'silver'
+# Databricks notebook source
+# =============================================================================
+# GLOBALMART — SILVER LAYER ORDERS TRANSFORMATION
+# Purpose: Clean, standardize, and validate order data including date parsing.
+# =============================================================================
 
 from pyspark.sql.functions import col, when, to_timestamp, expr, lit, concat_ws, current_timestamp
 from pyspark import pipelines as dp
 
-# Define rules
+# Configuration
+catalog = 'dbx_hck_glbl_mart'
+read_schema = 'bronze'
+write_schema = 'silver'
+
+# Data Quality Rules for Expectations
 rules = {
     "valid_order_id": "order_id IS NOT NULL",
     "valid_customer_id": "customer_id IS NOT NULL",
@@ -18,19 +22,22 @@ rules = {
     "valid_order_status": "order_status IN ('delivered','shipped','unavailable','canceled','processing','invoiced','created')"
 }
 
-
 def parse_std_datetime(column):
     """
-    Convert a column to timestamp type with standard format yyyy-MM-dd HH:mm
+    Converts a string column to a timestamp type using a consistent format.
     """
     return to_timestamp(col(column), "yyyy-MM-dd HH:mm")
 
 @dp.temporary_view()
 def silver_orders_standardized():
-    # 3a. Read standardized raw orders table
+    """
+    Standardizes raw order data by handling date conversion, filling missing 
+    columns, and unifying shipping mode terminology.
+    """
+    # Load raw data from Bronze
     df = spark.read.table(f"{catalog}.{read_schema}.bronze_orders")
     
-    # 3b. Standardize datetime columns
+    # Standardize all datetime-related columns
     datetime_cols = [
         "order_purchase_date",
         "order_approved_at",
@@ -43,11 +50,10 @@ def silver_orders_standardized():
         if col_name in df.columns:
             df = df.withColumn(col_name, parse_std_datetime(col_name))
         else:
-            # Handle missing column (e.g., R5 issue)
-            from pyspark.sql.functions import lit
+            # Handle regional missing columns (e.g., Region 5) by providing NULLs
             df = df.withColumn(col_name, lit(None).cast("timestamp"))
     
-    # 3c. Standardize ship_mode
+    # Normalize shipping mode variants to standard business terms
     df = df.withColumn(
         "ship_mode",
         when(col("ship_mode").isin("1st Class", "First Class"), "First Class")
@@ -56,28 +62,34 @@ def silver_orders_standardized():
         .otherwise(col("ship_mode"))
     )
     
-    # 3d. Return cleaned DataFrame
     return df
 
-
-# 3️3 Orders table decorator
 @dp.expect_all_or_drop(rules)
 @dp.table(
     name=f"{catalog}.{write_schema}.silver_orders_clean"
 )
 def silver_orders_clean():
+    """
+    Final Silver table for valid orders. Drops any records that do not 
+    meet the defined data quality rules.
+    """
     return spark.read.table("silver_orders_standardized")
-
 
 @dp.table(name=f"{catalog}.{write_schema}.silver_orders_quaruntine")
 def silver_orders_rejects():
-    df = spark.read.table("bronze_orders")
+    """
+    Captures records failing validation into a quarantine table. 
+    Concatenates specific rule violations into an error_reason column.
+    """
+    df = spark.read.table(f"{catalog}.{read_schema}.bronze_orders")
 
+    # Evaluate which specific rules were violated
     error_conditions = [
         when(~expr(rule), lit(rule_name))
         for rule_name, rule in rules.items()
     ]
 
+    # Combine all violated rules into a comma-separated list
     df_with_errors = df.withColumn(
         "error_reason",
         concat_ws(",", *error_conditions)
