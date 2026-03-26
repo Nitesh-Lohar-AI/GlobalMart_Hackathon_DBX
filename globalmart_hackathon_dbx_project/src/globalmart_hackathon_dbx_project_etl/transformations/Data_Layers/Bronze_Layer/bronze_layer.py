@@ -66,10 +66,6 @@ TXN_HINTS = (
     "payment_type STRING, payment_installments INTEGER"
 )
 
-# TXN_HINTS = (
-#     "order_id STRING, product_id STRING, Sales DOUBLE, Quantity INTEGER, "
-#     "discount STRING, profit DOUBLE, payment_type STRING, payment_installments INTEGER"
-# )
 RETURNS_HINTS = (
     # File 1 (R6) schema
     "order_id STRING, return_reason STRING, return_date STRING, "
