@@ -6,73 +6,16 @@
 
 # COMMAND ----------
 
-from pyspark.sql import functions as F
- 
-CATALOG = "dbx_hck_glbl_mart"
-
-SCHEMA = "gold"
-
-TABLES = [
-
-    f"{CATALOG}.{SCHEMA}.fact_returns",
-
-    f"{CATALOG}.{SCHEMA}.dim_customer",
-
-]
-
-SAMPLE_ROWS = 5
-
-NULL_PROFILE_LIMIT_COLS = 25  # keep output readable
- 
-def safe_table_info(full_name: str):
-
-    print("\n" + "=" * 80)
-
-    print(f"TABLE: {full_name}")
-
-    try:
-
-        df = spark.table(full_name)
-
-        print("Row count:", df.count())
-
-        df.printSchema()
-
-        display(df.limit(SAMPLE_ROWS))
- 
-        # Null-profile for first N columns (helps pick correct rule fields)
-
-        cols = df.columns[:NULL_PROFILE_LIMIT_COLS]
-
-        if cols:
-
-            nulls = df.select([
-
-                F.sum(F.col(c).isNull().cast("int")).alias(c) for c in cols
-
-            ])
-
-            print(f"Null counts (first {len(cols)} cols):")
-
-            display(nulls)
-
-        else:
-
-            print("No columns found.")
-
-    except Exception as e:
-
-        print("ERROR:", str(e)[:800])
- 
-for t in TABLES:
-
-    safe_table_info(t)
- 
+# MAGIC %md
+# MAGIC ## 1) Setup and Configuration
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ## 1) Setup and Configuration
+# MAGIC %pip install openai
+
+# COMMAND ----------
+
+# MAGIC %restart_python
 
 # COMMAND ----------
 
@@ -85,23 +28,29 @@ from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
 MODEL_NAME = "databricks-gpt-oss-20b"
-SOURCE_RETURNS = "globalmart.gold.fact_returns"
-SOURCE_CUSTOMERS = "globalmart.gold.dim_customers"
-TARGET_TABLE = "globalmart.gold.flagged_return_customers"
+
+# Workspace-specific catalogs/schemas
+INPUT_CATALOG = "dbx_hck_glbl_mart"
+INPUT_SCHEMA = "gold"
+OUTPUT_CATALOG = "dbx_hck_glbl_mart"
+OUTPUT_SCHEMA = "gold"
+
+SOURCE_RETURNS = f"{INPUT_CATALOG}.{INPUT_SCHEMA}.fact_returns"
+SOURCE_CUSTOMERS = f"{INPUT_CATALOG}.{INPUT_SCHEMA}.dim_customer"
+TARGET_TABLE = f"{OUTPUT_CATALOG}.{OUTPUT_SCHEMA}.flagged_return_customers"
 
 # Scoring setup
 FLAG_THRESHOLD = 65
 LOWER_THRESHOLD_DELTA = 10
-HIGH_VALUE_RETURN_AMT = 200.0
 BURST_WINDOW_DAYS = 30
 SHORT_WINDOW_DAYS = 7
 
 RULE_WEIGHTS = {
-    "rule_no_matching_order": 30,
     "rule_high_return_frequency": 20,
-    "rule_high_return_value": 20,
+    "rule_high_return_value": 25,
+    "rule_negative_days_to_return": 20,
     "rule_multi_region_returns": 15,
-    "rule_repeat_high_value_items": 15
+    "rule_high_non_approved_ratio": 20
 }
 
 
@@ -131,7 +80,7 @@ returns_df = spark.table(SOURCE_RETURNS)
 customers_df = spark.table(SOURCE_CUSTOMERS)
 
 print("fact_returns columns:", returns_df.columns)
-print("dim_customers columns:", customers_df.columns)
+print("dim_customer columns:", customers_df.columns)
 
 
 # COMMAND ----------
@@ -143,91 +92,84 @@ def pick_col(df, candidates, default_expr=None):
             return F.col(c)
     return default_expr
 
-customer_key = pick_col(returns_df, ["customer_id", "cust_id", "customer_key"], F.lit(None))
-return_id_col = pick_col(returns_df, ["return_id", "id"], F.monotonically_increasing_id())
-return_value_col = pick_col(returns_df, ["return_amount", "return_value", "amount"], F.lit(0.0)).cast("double")
-return_date_col = pick_col(returns_df, ["return_date", "created_at", "event_date"], F.current_date())
-region_col = pick_col(returns_df, ["region", "return_region", "store_region"], F.lit("unknown"))
-order_id_col = pick_col(returns_df, ["order_id", "original_order_id", "source_order_id"], F.lit(None))
-matched_order_flag_col = pick_col(returns_df, ["has_matching_order", "matching_order_flag", "is_order_matched"], None)
-item_id_col = pick_col(returns_df, ["product_id", "item_id", "sku"], F.lit("unknown_item"))
+# fact_returns (dbx_hck_glbl_mart.gold.fact_returns) columns we rely on:
+# customer_id, order_id, region_name, return_reason, return_date (string), refund_amount, return_status, is_approved, days_to_return
 
 returns_norm = (
     returns_df
     .select(
-        customer_key.cast("string").alias("customer_id"),
-        return_id_col.cast("string").alias("return_id"),
-        return_value_col.alias("return_value"),
-        F.to_date(return_date_col).alias("return_date"),
-        region_col.cast("string").alias("region"),
-        order_id_col.cast("string").alias("order_id"),
-        item_id_col.cast("string").alias("item_id"),
-        (matched_order_flag_col.cast("boolean") if matched_order_flag_col is not None else F.lit(None).cast("boolean")).alias("has_matching_order")
+        F.col("customer_id").cast("string").alias("customer_id"),
+        F.col("order_id").cast("string").alias("order_id"),
+        F.col("vendor_id").cast("string").alias("vendor_id"),
+        F.col("region_name").cast("string").alias("region_name"),
+        F.col("return_reason").cast("string").alias("return_reason"),
+        F.to_date(F.col("return_date").cast("string")).alias("return_date"),
+        F.col("refund_amount").cast("double").alias("return_value"),
+        F.col("return_status").cast("string").alias("return_status"),
+        F.col("is_approved").cast("boolean").alias("is_approved"),
+        F.col("days_to_return").cast("int").alias("days_to_return"),
     )
     .filter(F.col("customer_id").isNotNull())
 )
 
-# If explicit matching flag is unavailable, infer from null order_id.
-returns_norm = returns_norm.withColumn(
-    "is_no_matching_order",
-    F.when(F.col("has_matching_order").isNotNull(), ~F.col("has_matching_order"))
-     .otherwise(F.col("order_id").isNull())
-)
-
-returns_norm = returns_norm.withColumn("is_high_value_return", F.col("return_value") >= F.lit(HIGH_VALUE_RETURN_AMT))
-
+# Establish time anchor for burst windows
 latest_date = returns_norm.select(F.max("return_date").alias("mx")).first()["mx"]
 if latest_date is None:
     latest_date = datetime.utcnow().date()
 
-returns_window = returns_norm.withColumn(
-    "is_recent_30d",
-    F.col("return_date") >= F.date_sub(F.lit(latest_date), BURST_WINDOW_DAYS)
-).withColumn(
-    "is_recent_7d",
-    F.col("return_date") >= F.date_sub(F.lit(latest_date), SHORT_WINDOW_DAYS)
-)
-
-repeat_high_value_items = (
-    returns_window
-    .filter(F.col("is_high_value_return"))
-    .groupBy("customer_id", "item_id")
-    .agg(F.count("return_id").alias("item_return_count"))
-    .filter(F.col("item_return_count") >= 2)
-    .groupBy("customer_id")
-    .agg(F.count("item_id").alias("repeat_high_value_item_count"))
+returns_window = (
+    returns_norm
+    .withColumn("is_recent_30d", F.col("return_date") >= F.date_sub(F.lit(latest_date), BURST_WINDOW_DAYS))
+    .withColumn("is_recent_7d", F.col("return_date") >= F.date_sub(F.lit(latest_date), SHORT_WINDOW_DAYS))
+    .withColumn("is_negative_days_to_return", (F.col("days_to_return") < F.lit(0)).cast("int"))
+    .withColumn(
+        "is_non_approved",
+        (
+            (~F.col("is_approved"))
+            | (F.lower(F.col("return_status")).isin("rejected", "pending"))
+        ).cast("int"),
+    )
 )
 
 profiles = (
     returns_window
     .groupBy("customer_id")
     .agg(
-        F.countDistinct("return_id").alias("total_returns"),
+        F.count(F.lit(1)).alias("total_returns"),
         F.round(F.sum(F.coalesce(F.col("return_value"), F.lit(0.0))), 2).alias("total_return_value"),
         F.round(F.avg(F.coalesce(F.col("return_value"), F.lit(0.0))), 2).alias("avg_return_value"),
-        F.sum(F.when(F.col("is_high_value_return"), 1).otherwise(0)).alias("high_value_returns"),
-        F.sum(F.when(F.col("is_no_matching_order"), 1).otherwise(0)).alias("no_matching_order_returns"),
-        F.countDistinct("region").alias("distinct_regions"),
+        F.countDistinct("region_name").alias("distinct_regions"),
+        F.sum(F.col("is_negative_days_to_return")).alias("negative_days_to_return_count"),
+        F.sum(F.col("is_non_approved")).alias("non_approved_returns"),
         F.sum(F.when(F.col("is_recent_30d"), 1).otherwise(0)).alias("returns_last_30d"),
-        F.sum(F.when(F.col("is_recent_7d"), 1).otherwise(0)).alias("returns_last_7d")
+        F.sum(F.when(F.col("is_recent_7d"), 1).otherwise(0)).alias("returns_last_7d"),
     )
-    .join(repeat_high_value_items, on="customer_id", how="left")
-    .fillna({"repeat_high_value_item_count": 0})
-    .withColumn("no_matching_order_ratio", F.when(F.col("total_returns") > 0, F.col("no_matching_order_returns") / F.col("total_returns")).otherwise(F.lit(0.0)))
-    .withColumn("high_value_return_ratio", F.when(F.col("total_returns") > 0, F.col("high_value_returns") / F.col("total_returns")).otherwise(F.lit(0.0)))
+    .withColumn(
+        "negative_days_to_return_ratio",
+        F.when(F.col("total_returns") > 0, F.col("negative_days_to_return_count") / F.col("total_returns")).otherwise(F.lit(0.0)),
+    )
+    .withColumn(
+        "non_approved_ratio",
+        F.when(F.col("total_returns") > 0, F.col("non_approved_returns") / F.col("total_returns")).otherwise(F.lit(0.0)),
+    )
 )
 
-customer_name_col = pick_col(customers_df, ["customer_name", "full_name", "name"], F.lit(None))
-customer_region_col = pick_col(customers_df, ["region", "home_region", "customer_region"], F.lit(None))
-customer_tier_col = pick_col(customers_df, ["customer_tier", "segment", "loyalty_tier"], F.lit(None))
-customer_id_dim_col = pick_col(customers_df, ["customer_id", "cust_id", "customer_key"], F.lit(None))
+# dim_customer columns: customer_id, customer_email, customer_name, segment, country, city, state, postal_code, region
+customer_id_dim_col = pick_col(customers_df, ["customer_id"], F.lit(None))
+customer_name_col = pick_col(customers_df, ["customer_name"], F.lit(None))
+customer_region_col = pick_col(customers_df, ["region"], F.lit(None))
+customer_segment_col = pick_col(customers_df, ["segment"], F.lit(None))
 
-customers_norm = customers_df.select(
-    customer_id_dim_col.cast("string").alias("customer_id"),
-    customer_name_col.cast("string").alias("customer_name"),
-    customer_region_col.cast("string").alias("customer_region"),
-    customer_tier_col.cast("string").alias("customer_tier")
-).dropDuplicates(["customer_id"])
+customers_norm = (
+    customers_df
+    .select(
+        customer_id_dim_col.cast("string").alias("customer_id"),
+        customer_name_col.cast("string").alias("customer_name"),
+        customer_region_col.cast("string").alias("customer_region"),
+        customer_segment_col.cast("string").alias("customer_tier"),
+    )
+    .dropDuplicates(["customer_id"])
+)
 
 profiles = profiles.join(customers_norm, on="customer_id", how="left")
 display(profiles.orderBy(F.desc("total_return_value")))
@@ -241,43 +183,45 @@ display(profiles.orderBy(F.desc("total_return_value")))
 # COMMAND ----------
 
 # Rule thresholds (defensible defaults; tune with data distribution)
-THRESH_NO_MATCHING_ORDER_RATIO = 0.35
 THRESH_TOTAL_RETURNS = 8
 THRESH_TOTAL_RETURN_VALUE = 1000.0
+THRESH_NEGATIVE_DAYS_RATIO = 0.15
 THRESH_DISTINCT_REGIONS = 3
-THRESH_REPEAT_HIGH_VALUE_ITEMS = 2
+THRESH_NON_APPROVED_RATIO = 0.50
 
 scored = (
     profiles
-    .withColumn("rule_no_matching_order", (F.col("no_matching_order_ratio") >= F.lit(THRESH_NO_MATCHING_ORDER_RATIO)).cast("int"))
     .withColumn("rule_high_return_frequency", (F.col("total_returns") >= F.lit(THRESH_TOTAL_RETURNS)).cast("int"))
     .withColumn("rule_high_return_value", (F.col("total_return_value") >= F.lit(THRESH_TOTAL_RETURN_VALUE)).cast("int"))
+    .withColumn("rule_negative_days_to_return", (F.col("negative_days_to_return_ratio") >= F.lit(THRESH_NEGATIVE_DAYS_RATIO)).cast("int"))
     .withColumn("rule_multi_region_returns", (F.col("distinct_regions") >= F.lit(THRESH_DISTINCT_REGIONS)).cast("int"))
-    .withColumn("rule_repeat_high_value_items", (F.col("repeat_high_value_item_count") >= F.lit(THRESH_REPEAT_HIGH_VALUE_ITEMS)).cast("int"))
-    .withColumn("score_no_matching_order", F.col("rule_no_matching_order") * F.lit(RULE_WEIGHTS["rule_no_matching_order"]))
+    .withColumn("rule_high_non_approved_ratio", (F.col("non_approved_ratio") >= F.lit(THRESH_NON_APPROVED_RATIO)).cast("int"))
     .withColumn("score_high_return_frequency", F.col("rule_high_return_frequency") * F.lit(RULE_WEIGHTS["rule_high_return_frequency"]))
     .withColumn("score_high_return_value", F.col("rule_high_return_value") * F.lit(RULE_WEIGHTS["rule_high_return_value"]))
+    .withColumn("score_negative_days_to_return", F.col("rule_negative_days_to_return") * F.lit(RULE_WEIGHTS["rule_negative_days_to_return"]))
     .withColumn("score_multi_region_returns", F.col("rule_multi_region_returns") * F.lit(RULE_WEIGHTS["rule_multi_region_returns"]))
-    .withColumn("score_repeat_high_value_items", F.col("rule_repeat_high_value_items") * F.lit(RULE_WEIGHTS["rule_repeat_high_value_items"]))
+    .withColumn("score_high_non_approved_ratio", F.col("rule_high_non_approved_ratio") * F.lit(RULE_WEIGHTS["rule_high_non_approved_ratio"]))
     .withColumn(
         "anomaly_score",
-        F.col("score_no_matching_order")
-        + F.col("score_high_return_frequency")
+        F.col("score_high_return_frequency")
         + F.col("score_high_return_value")
+        + F.col("score_negative_days_to_return")
         + F.col("score_multi_region_returns")
-        + F.col("score_repeat_high_value_items")
+        + F.col("score_high_non_approved_ratio")
     )
 )
 
 scored = scored.withColumn(
     "rules_violated",
-    F.expr("filter(array("
-           "IF(rule_no_matching_order = 1, 'rule_no_matching_order', NULL),"
-           "IF(rule_high_return_frequency = 1, 'rule_high_return_frequency', NULL),"
-           "IF(rule_high_return_value = 1, 'rule_high_return_value', NULL),"
-           "IF(rule_multi_region_returns = 1, 'rule_multi_region_returns', NULL),"
-           "IF(rule_repeat_high_value_items = 1, 'rule_repeat_high_value_items', NULL)"
-           "), x -> x is not null)")
+    F.expr(
+        "filter(array("
+        "IF(rule_high_return_frequency = 1, 'rule_high_return_frequency', NULL),"
+        "IF(rule_high_return_value = 1, 'rule_high_return_value', NULL),"
+        "IF(rule_negative_days_to_return = 1, 'rule_negative_days_to_return', NULL),"
+        "IF(rule_multi_region_returns = 1, 'rule_multi_region_returns', NULL),"
+        "IF(rule_high_non_approved_ratio = 1, 'rule_high_non_approved_ratio', NULL)"
+        "), x -> x is not null)"
+    )
 )
 
 scored = scored.withColumn("is_flagged", F.col("anomaly_score") >= F.lit(FLAG_THRESHOLD))
@@ -309,29 +253,63 @@ print(f"Flagged @ threshold {lower_threshold}: {flagged_count_lower} (additional
 
 PROMPT_TEMPLATE = """
 You are an investigation assistant for GlobalMart returns operations.
-Write one concise investigation brief for a flagged customer using exactly 3 short sections:
-1) Suspicious patterns
-2) Possible innocent explanations
-3) First verification actions
+
+Generate a strictly formatted investigation brief using EXACTLY the structure below.
+
+OUTPUT FORMAT (follow exactly, do not deviate):
+
+**Investigation Brief: {customer_id} ({customer_name})**
+
+1. Suspicious patterns
+
+* Bullet 1 (must include numeric values from context)
+* Bullet 2
+* Bullet 3
+
+2. Possible innocent explanations
+
+* Bullet 1
+* Bullet 2
+* Bullet 3
+
+3. First verification actions
+
+* Action 1 (must be actionable and specific)
+* Action 2
+* Action 3
+
+STRICT RULES:
+
+* The first line MUST be exactly: **Investigation Brief - {customer_id} ({customer_name})**
+* Do NOT add any extra text before or after the header.
+* Use ONLY bullet points (no paragraphs, no numbering inside sections).
+* Each section must have EXACTLY 3 bullets (no more, no less).
+* Each bullet must be ONE sentence only.
+* Always include numeric values where available (e.g., %, counts, $).
+* Do NOT repeat the same metric across multiple bullets unless necessary.
+* Do NOT add introductions, conclusions, or extra headings.
+* Do NOT mention "customer context" explicitly.
+* Keep tone operational, concise, and consistent.
+* Do NOT make legal conclusions.
 
 Customer context:
-- customer_id: {customer_id}
-- customer_name: {customer_name}
-- customer_region: {customer_region}
-- customer_tier: {customer_tier}
-- anomaly_score: {anomaly_score}
-- rules_violated: {rules_violated}
-- total_returns: {total_returns}
-- total_return_value: {total_return_value}
-- avg_return_value: {avg_return_value}
-- no_matching_order_returns: {no_matching_order_returns}
-- no_matching_order_ratio: {no_matching_order_ratio}
-- returns_last_30d: {returns_last_30d}
-- returns_last_7d: {returns_last_7d}
-- high_value_returns: {high_value_returns}
-- high_value_return_ratio: {high_value_return_ratio}
-- distinct_regions: {distinct_regions}
-- repeat_high_value_item_count: {repeat_high_value_item_count}
+
+* customer_id: {customer_id}
+* customer_name: {customer_name}
+* customer_region: {customer_region}
+* customer_tier: {customer_tier}
+* anomaly_score: {anomaly_score}
+* rules_violated: {rules_violated}
+* total_returns: {total_returns}
+* total_return_value: {total_return_value}
+* avg_return_value: {avg_return_value}
+* returns_last_30d: {returns_last_30d}
+* returns_last_7d: {returns_last_7d}
+* distinct_regions: {distinct_regions}
+* negative_days_to_return_count: {negative_days_to_return_count}
+* negative_days_to_return_ratio: {negative_days_to_return_ratio}
+* non_approved_returns: {non_approved_returns}
+* non_approved_ratio: {non_approved_ratio}
 
 Requirements:
 - Use concrete values from the provided context.
@@ -407,14 +385,13 @@ for r in flagged_rows:
         "total_returns": int(r["total_returns"] or 0),
         "total_return_value": float(r["total_return_value"] or 0.0),
         "avg_return_value": float(r["avg_return_value"] or 0.0),
-        "no_matching_order_returns": int(r["no_matching_order_returns"] or 0),
-        "no_matching_order_ratio": round(float(r["no_matching_order_ratio"] or 0.0), 4),
         "returns_last_30d": int(r["returns_last_30d"] or 0),
         "returns_last_7d": int(r["returns_last_7d"] or 0),
-        "high_value_returns": int(r["high_value_returns"] or 0),
-        "high_value_return_ratio": round(float(r["high_value_return_ratio"] or 0.0), 4),
         "distinct_regions": int(r["distinct_regions"] or 0),
-        "repeat_high_value_item_count": int(r["repeat_high_value_item_count"] or 0)
+        "negative_days_to_return_count": int(r["negative_days_to_return_count"] or 0),
+        "negative_days_to_return_ratio": round(float(r["negative_days_to_return_ratio"] or 0.0), 4),
+        "non_approved_returns": int(r["non_approved_returns"] or 0),
+        "non_approved_ratio": round(float(r["non_approved_ratio"] or 0.0), 4),
     }
     brief = generate_brief(payload)
 
@@ -432,14 +409,13 @@ output_schema = T.StructType([
     T.StructField("total_returns", T.IntegerType(), True),
     T.StructField("total_return_value", T.DoubleType(), True),
     T.StructField("avg_return_value", T.DoubleType(), True),
-    T.StructField("no_matching_order_returns", T.IntegerType(), True),
-    T.StructField("no_matching_order_ratio", T.DoubleType(), True),
     T.StructField("returns_last_30d", T.IntegerType(), True),
     T.StructField("returns_last_7d", T.IntegerType(), True),
-    T.StructField("high_value_returns", T.IntegerType(), True),
-    T.StructField("high_value_return_ratio", T.DoubleType(), True),
     T.StructField("distinct_regions", T.IntegerType(), True),
-    T.StructField("repeat_high_value_item_count", T.IntegerType(), True),
+    T.StructField("negative_days_to_return_count", T.IntegerType(), True),
+    T.StructField("negative_days_to_return_ratio", T.DoubleType(), True),
+    T.StructField("non_approved_returns", T.IntegerType(), True),
+    T.StructField("non_approved_ratio", T.DoubleType(), True),
     T.StructField("anomaly_score", T.IntegerType(), True),
     T.StructField("rules_violated", T.StringType(), True),
     T.StructField("ai_investigation_brief", T.StringType(), True),
@@ -448,7 +424,7 @@ output_schema = T.StructType([
 
 output_df = spark.createDataFrame(output_rows, schema=output_schema) if output_rows else spark.createDataFrame([], schema=output_schema)
 
-spark.sql("CREATE SCHEMA IF NOT EXISTS globalmart.gold")
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {OUTPUT_CATALOG}.{OUTPUT_SCHEMA}")
 (
     output_df
     .write
@@ -473,12 +449,24 @@ result_df.printSchema()
 
 display(result_df.orderBy(F.desc("anomaly_score")))
 
-display(
+# Evidence: non-truncated briefs
+_topN = 3
+rows = (
     result_df
     .select("customer_id", "anomaly_score", "rules_violated", "ai_investigation_brief")
     .orderBy(F.desc("anomaly_score"))
-    .limit(3)
+    .limit(_topN)
+    .collect()
 )
+
+for i, r in enumerate(rows, start=1):
+    print("=" * 80)
+    print(f"Top case #{i}")
+    print(f"customer_id: {r['customer_id']}")
+    print(f"anomaly_score: {r['anomaly_score']}")
+    print(f"rules_violated: {r['rules_violated']}")
+    print("ai_investigation_brief:")
+    print(r["ai_investigation_brief"])
 
 
 # COMMAND ----------
@@ -488,28 +476,3 @@ top_case = result_df.orderBy(F.desc("anomaly_score")).limit(1)
 display(top_case)
 
 print("Use this top case to verify brief alignment with violated rules and first-action recommendations.")
-
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 6) Required Narrative Answers
-# MAGIC
-# MAGIC ### Rules, Weights, and Rationale
-# MAGIC - `rule_no_matching_order` (weight 30) is strongest because returns lacking order linkage are difficult to validate and highly correlated with abuse or process manipulation.
-# MAGIC - `rule_high_return_frequency` (20) captures unusually frequent return behavior.
-# MAGIC - `rule_high_return_value` (20) captures elevated financial impact.
-# MAGIC - `rule_multi_region_returns` (15) captures cross-region behavioral inconsistency.
-# MAGIC - `rule_repeat_high_value_items` (15) captures repeated high-value return patterns.
-# MAGIC
-# MAGIC ### Threshold Choice and Workload Impact
-# MAGIC - Default threshold is `65` to focus on stronger, multi-signal cases.
-# MAGIC - Lowering threshold by 10 points (`55`) expands coverage but increases investigation load; the exact increase is printed in the threshold analysis cell.
-# MAGIC
-# MAGIC ### Flagged Case Volume Realism
-# MAGIC - Compare flagged customer count to daily capacity (40-60 requests/day) and investigator staffing.
-# MAGIC - Adjust threshold if queue size is operationally unrealistic.
-# MAGIC
-# MAGIC ### Highest-Risk Customer Brief Review
-# MAGIC - Use top-case output above.
-# MAGIC - Confirm brief references violated rules and includes concrete first verification actions.
